@@ -15,78 +15,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CONFIGURATION ---
-# Fetches from Railway Environment Variables
 ARL_COOKIE = os.getenv("ARL_COOKIE")
 SECRET_KEY = b"jo6a16n6gu5p096e"
 PRIVATE_API = "https://www.deezer.com/ajax/gw-light.php"
 
-# Safety check
-if not ARL_COOKIE:
-    print("❌ ERROR: ARL_COOKIE environment variable is not set!")
-
-# --- SESSION MANAGEMENT ---
+# Strict headers to look like the official Android App
+HEADERS = {
+    "User-Agent": "Deezer/9.41.0.1 (Android; 13; Mobile; en)",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "max-age=0",
+}
 
 async def get_user_token(client: httpx.AsyncClient):
     """Login with ARL and get the user API token"""
-    res = await client.post(
-        PRIVATE_API,
-        params={
-            "method": "deezer.getUserData",
-            "input": "3",
-            "api_version": "1.0",
-            "api_token": "",
-        },
-    )
-    data = res.json()
-    # Handle cases where login might fail
     try:
-        token = data["results"]["checkForm"]
-        return token
-    except KeyError:
-        print(f"Login failed. Response: {data}")
+        res = await client.post(
+            PRIVATE_API,
+            params={"method": "deezer.getUserData", "input": "3", "api_version": "1.0"},
+            headers=HEADERS
+        )
+        data = res.json()
+        return data.get("results", {}).get("checkForm")
+    except Exception:
         return None
 
-async def get_track_info(client: httpx.AsyncClient, api_token: str, track_id: str):
-    res = await client.post(
-        PRIVATE_API,
-        params={
-            "method": "song.getData",
-            "input": "3",
-            "api_version": "1.0",
-            "api_token": api_token,
-        },
-        json={"sng_id": track_id},
-    )
-    data = res.json()
-    return data["results"]
-
-# --- URL GENERATION (Your Logic) ---
-
-def generate_download_url(track_info: dict):
-    format_id = "1"
-    md5_origin = track_info["MD5_ORIGIN"]
-    media_version = track_info["MEDIA_VERSION"]
-    song_id = track_info["SNG_ID"]
-
-    hash_input = "¤".join([md5_origin, format_id, str(song_id), str(media_version)])
-    m = hashlib.md5()
-    m.update(hash_input.encode("utf-8"))
-    hash_result = m.hexdigest()
-
-    url_part = "¤".join([hash_result, hash_input, ""])
-    while len(url_part) % 16 != 0:
-        url_part += " "
-
-    aes_key = b"jo6aey6haid2Teih"
-    cipher = AES.new(aes_key, AES.MODE_ECB)
-    encrypted = cipher.encrypt(url_part.encode("utf-8"))
-    encrypted_hex = encrypted.hex()
-
-    return f"https://e-cdns-proxy-{md5_origin[0]}.dzcdn.net/mobile/1/{encrypted_hex}"
-
-# --- DECRYPTION (Your Logic) ---
-
+# --- CRYPTO (Your Logic) ---
 def derive_blowfish_key(track_id: str):
     m = hashlib.md5()
     m.update(track_id.encode())
@@ -97,75 +50,85 @@ def derive_blowfish_key(track_id: str):
         key += bytes([val])
     return key
 
-def decrypt_chunk(chunk, key):
-    cipher = Blowfish.new(key, Blowfish.MODE_ECB)
-    return cipher.decrypt(chunk)
+def generate_download_url(track_info: dict):
+    format_id = "1"
+    hash_input = "¤".join([track_info["MD5_ORIGIN"], format_id, track_info["SNG_ID"], track_info["MEDIA_VERSION"]])
+    m = hashlib.md5()
+    m.update(hash_input.encode("utf-8"))
+    hash_result = m.hexdigest()
+    url_part = "¤".join([hash_result, hash_input, ""])
+    while len(url_part) % 16 != 0: url_part += " "
+    cipher = AES.new(b"jo6aey6haid2Teih", AES.MODE_ECB)
+    return f"https://e-cdns-proxy-{track_info['MD5_ORIGIN'][0]}.dzcdn.net/mobile/1/{cipher.encrypt(url_part.encode()).hex()}"
 
 # --- ENDPOINTS ---
 
-@app.get("/")
-def home():
-    return {"status": "Deezer Proxy API is running"}
-
 @app.get("/api/search")
 async def search(query: str):
-    """Search using ARL session to avoid empty data in blocked regions"""
-    async with httpx.AsyncClient(cookies={"arl": ARL_COOKIE}) as client:
-        # We use the private search method because it bypasses regional blocks better
-        api_token = await get_user_token(client)
-        if not api_token:
-             raise HTTPException(status_code=401, detail="Deezer session rejected.")
-             
-        res = await client.post(
-            PRIVATE_API,
-            params={"method": "search.getSongs", "input": "3", "api_version": "1.0", "api_token": api_token},
-            json={"QUERY": query, "NB": 20}
-        )
-        data = res.json()
-        tracks = data.get("results", {}).get("data", [])
-        return {"data": [{
-            "id": t.get("SNG_ID"),
-            "title": t.get("SNG_TITLE"),
-            "artist": t.get("ART_NAME"),
-            "image": f"https://e-cdns-images.dzcdn.net/images/cover/{t.get('ALB_PICTURE')}/250x250.jpg"
-        } for t in tracks]}
+    async with httpx.AsyncClient(cookies={"arl": ARL_COOKIE}, headers=HEADERS) as client:
+        # 1. Try Private Search first
+        token = await get_user_token(client)
+        if token:
+            res = await client.post(
+                PRIVATE_API,
+                params={"method": "search.getSongs", "input": "3", "api_version": "1.0", "api_token": token},
+                json={"QUERY": query, "NB": 20}
+            )
+            data = res.json()
+            tracks = data.get("results", {}).get("data", [])
+            
+            if tracks:
+                return {"source": "private", "data": [{
+                    "id": t.get("SNG_ID"),
+                    "title": t.get("SNG_TITLE"),
+                    "artist": t.get("ART_NAME"),
+                    "image": f"https://e-cdns-images.dzcdn.net/images/cover/{t.get('ALB_PICTURE')}/250x250.jpg"
+                } for t in tracks if t.get("SNG_ID")]}
+
+        # 2. Fallback to Public Search (Since your server is in the USA, this should work)
+        public_res = await client.get(f"https://api.deezer.com/search?q={query}")
+        public_data = public_res.json()
+        public_tracks = public_data.get("data", [])
+
+        if public_tracks:
+            return {"source": "public", "data": [{
+                "id": str(t.get("id")),
+                "title": t.get("title"),
+                "artist": t.get("artist", {}).get("name"),
+                "image": t.get("album", {}).get("cover_medium")
+            } for t in public_tracks]}
+
+        return {"data": [], "debug": "Both private and public search returned no data."}
 
 @app.get("/api/stream-deezer/{track_id}")
 async def stream_deezer(track_id: str):
-    try:
-        async with httpx.AsyncClient(
-            cookies={"arl": ARL_COOKIE},
-            headers={"User-Agent": "Mozilla/5.0"}
-        ) as client:
-
-            api_token = await get_user_token(client)
-            if not api_token:
-                raise HTTPException(status_code=401, detail="Session expired")
-
-            track_info = await get_track_info(client, api_token, track_id)
+    async with httpx.AsyncClient(cookies={"arl": ARL_COOKIE}, headers=HEADERS) as client:
+        try:
+            token = await get_user_token(client)
+            res = await client.post(
+                PRIVATE_API,
+                params={"method": "song.getData", "input": "3", "api_version": "1.0", "api_token": token},
+                json={"sng_id": track_id},
+            )
+            track_info = res.json().get("results")
             cdn_url = generate_download_url(track_info)
             bf_key = derive_blowfish_key(track_id)
+            cipher = Blowfish.new(bf_key, Blowfish.MODE_ECB)
 
             async def iterate_and_decrypt():
                 async with client.stream("GET", cdn_url) as r:
-                    if r.status_code != 200:
-                        raise HTTPException(status_code=r.status_code, detail="CDN Error")
                     chunk_index = 0
                     async for chunk in r.aiter_bytes(chunk_size=2048):
                         if chunk_index % 3 == 0 and len(chunk) == 2048:
-                            yield decrypt_chunk(chunk, bf_key)
+                            yield cipher.decrypt(chunk)
                         else:
                             yield chunk
                         chunk_index += 1
-
             return StreamingResponse(iterate_and_decrypt(), media_type="audio/mpeg")
-
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    # Railway provides the PORT environment variable
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
