@@ -104,19 +104,37 @@ async def search(query: str):
 async def stream_deezer(track_id: str):
     async with httpx.AsyncClient(cookies={"arl": ARL_COOKIE}, headers=HEADERS) as client:
         try:
-            token = await get_user_token(client)
+            # 1. Get the token (Handshake)
+            api_token = await get_user_token(client)
+            if not api_token:
+                raise HTTPException(status_code=401, detail="ARL Rejected by Deezer")
+
+            # 2. Get track info
             res = await client.post(
                 PRIVATE_API,
-                params={"method": "song.getData", "input": "3", "api_version": "1.0", "api_token": token},
+                params={"method": "song.getData", "input": "3", "api_version": "1.0", "api_token": api_token},
                 json={"sng_id": track_id},
             )
-            track_info = res.json().get("results")
+            data = res.json()
+            track_info = data.get("results")
+
+            # --- THE FIX: Check if MD5_ORIGIN exists ---
+            if not track_info or "MD5_ORIGIN" not in track_info:
+                print(f"FAILED TO GET STREAM DATA. Response: {data}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail="This song is restricted or requires a Premium ARL."
+                )
+            
+            # 3. Proceed with decryption if data exists
             cdn_url = generate_download_url(track_info)
             bf_key = derive_blowfish_key(track_id)
             cipher = Blowfish.new(bf_key, Blowfish.MODE_ECB)
 
             async def iterate_and_decrypt():
                 async with client.stream("GET", cdn_url) as r:
+                    if r.status_code != 200:
+                        return # Stop if CDN fails
                     chunk_index = 0
                     async for chunk in r.aiter_bytes(chunk_size=2048):
                         if chunk_index % 3 == 0 and len(chunk) == 2048:
@@ -124,8 +142,12 @@ async def stream_deezer(track_id: str):
                         else:
                             yield chunk
                         chunk_index += 1
+            
             return StreamingResponse(iterate_and_decrypt(), media_type="audio/mpeg")
+
         except Exception as e:
+            # Log the full error to Railway console
+            print(f"STREAM ERROR: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
